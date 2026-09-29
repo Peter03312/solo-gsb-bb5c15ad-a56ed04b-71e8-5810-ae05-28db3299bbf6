@@ -330,17 +330,57 @@ class ReplaceResponse(BaseModel):
     view: BarrierView
 
 
+class WithdrawCheckinRequest(BaseModel):
+    participant_id: str = Field(
+        ...,
+        min_length=1,
+        description="要撤回报到的成员标识（必须仍在当前名单内且当前已报到）",
+    )
+    reason: str = Field(
+        ...,
+        min_length=1,
+        description="撤回原因，非空；去除首尾空白后不得为空字符串",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "WithdrawCheckinRequest":
+        # 与取消原因一致地去除首尾空白；成员标识与原因清洗后都不得为空。
+        pid = self.participant_id.strip()
+        reason = self.reason.strip()
+        if not pid:
+            raise ValueError("participant_id 不得为空白字符串")
+        if not reason:
+            raise ValueError("reason 不得为空白字符串")
+        self.participant_id = pid
+        self.reason = reason
+        return self
+
+
+class WithdrawCheckinResponse(BaseModel):
+    barrier_id: str
+    status: str = Field(description="withdrawn（本次撤回报到原子生效）")
+    participant_id: str = Field(description="被撤回报到的成员标识（撤回后可再次报到）")
+    reason: str = Field(description="本次撤回携带的非空原因")
+    group: str | None = Field(
+        default=None,
+        description="成员所属分组（撤回时该组去重报到人数同步扣减 1）；未启用分组配额时为 null",
+    )
+    withdrawn_at: datetime = Field(description="撤回生效时间（UTC）")
+    view: BarrierView
+
+
 class CheckinEvent(BaseModel):
     seq: int = Field(description="事件序号，从 1 开始单调递增，只追加不回改")
     participant_id: str = Field(
         description=(
-            "事件相关的参与者标识：报到事件为报到者；替补事件为换上的新标识"
+            "事件相关的参与者标识：报到/撤回事件为该成员；替补事件为换上的新标识"
         )
     )
     result: str = Field(
         description=(
             "checked_in | already_checked_in | reached | late | replaced"
-            "（replaced 为运行中参与者替补事件）"
+            " | withdrawn（replaced 为运行中参与者替补事件；"
+            "withdrawn 为达标前撤回报到事件，附带 reason）"
         )
     )
     ts: datetime = Field(description="事件发生时间（UTC）")
@@ -349,6 +389,10 @@ class CheckinEvent(BaseModel):
     original_participant_id: str | None = Field(
         default=None,
         description="仅替补事件出现：被换下的原参与者标识",
+    )
+    # 仅撤回事件（result=withdrawn）出现：本次撤回携带的非空原因。
+    reason: str | None = Field(
+        default=None, description="仅撤回事件出现：撤回报到的非空原因"
     )
 
 

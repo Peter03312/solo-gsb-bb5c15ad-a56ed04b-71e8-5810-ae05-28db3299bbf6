@@ -4,14 +4,16 @@
 
 ``barrier:{bid}``           hash  元数据（threshold、deadline、ttl_ms 等）
 ``barrier:{bid}:roster``    set   当前有效参与者名单（替补原子换人后为替换后的名单）
-``barrier:{bid}:checked``   set   所有有效报到（含达标后的迟到报到）
+``barrier:{bid}:checked``   set   所有有效报到（含达标后的迟到报到；
+                            报到撤回在达标前原子 SREM 已报到成员）
 ``barrier:{bid}:frozen``    hash  达标冻结快照，仅在达标后存在
                             （quorum/frozen_at/group_counts）
 ``barrier:{bid}:cancel``    hash  主动取消终态，仅在取消后存在（reason/cancelled_at）
 ``barrier:{bid}:events``    list  审计事件（JSON，seq 从 1 递增，只追加；
-                            含报到事件与运行中替补事件）
+                            含报到事件、报到撤回事件与运行中替补事件）
 ``barrier:{bid}:gmap``      hash  参与者 -> 分组名（仅启用分组配额时存在）
-``barrier:{bid}:gcheck``    hash  各分组去重后的报到人数（仅启用分组配额时存在）
+``barrier:{bid}:gcheck``    hash  各分组去重后的报到人数（仅启用分组配额时存在；
+                            撤回在同脚本内 HINCRBY -1 扣减所属组）
 ``barrier:{bid}:idem:idx``  set   本屏障已产生的批量报到幂等记录键集合，
                             随屏障一起 TTL；延期脚本据此一并顺延幂等记录存活期
 ``barrier:{bid}:idem:{h}``  hash  批量报到幂等记录（h = idempotency_key 的
@@ -25,11 +27,17 @@ Redis 单线程串行执行脚本，先发生者成为唯一终态，任何路�
 脚本与前两者同样地原子竞争：终态键（frozen/cancel）或已过截止的屏障一律
 拒绝延期与替补，绝不复活终态。批量报到由第五段 Lua 脚本在同一原子操作内
 完成全员名单校验、截止/取消校验、整批报到、达标冻结与幂等记录落盘。
+报到撤回由第六段 Lua 脚本在同一原子操作内完成终态/截止/名单/已报到校验、
+checked SREM、分组计数扣减与撤回审计事件追加：只有仍在 waiting 且该成员
+在当前名单内并已报到时才生效；若并发报到先使屏障达标，撤回必败且冻结
+名单与分组快照保持不变。
 
 频道 ``barrier:{bid}:events`` 在达标冻结后发布 ``reached`` 消息、
 在主动取消后发布 ``cancelled`` 消息、在成功延期后发布 ``deadline_extended``
 消息（通知挂起中的 /wait 回读最新 deadline 继续等待）、在成功替补后发布
-``participant_replaced`` 消息（通知挂起中的 /wait 回读替换后的名单）。
+``participant_replaced`` 消息（通知挂起中的 /wait 回读替换后的名单）、
+在成功撤回报到后发布 ``checkin_withdrawn`` 消息（通知等待者回读撤回后的
+最新进度，屏障仍未达标则继续等待）。
 """
 
 from __future__ import annotations
@@ -733,6 +741,108 @@ return {'ok', record_json}
 """
 
 
+# 报到撤回脚本（达标前误报纠正）。返回数组：
+#   {'unknown'}                                    屏障不存在
+#   {'reached', quorum_json, frozen_at}            已达标，冻结快照不可触碰，
+#                                                  撤回被拒绝（含并发报到先达标的瞬间）
+#   {'cancelled'}                                  已取消，撤回被拒绝
+#   {'expired'}                                    已过截止时间，撤回被拒绝
+#   {'not_participant', pid}                       成员不在当前名单内
+#                                                  （从未在名单或已被替补换下）
+#   {'not_checked_in', pid}                        成员在名单内但当前未报到
+#                                                  （从未报到或已撤回 —— 重复撤回）
+#   {'withdrawn', pid, group, ts, count}           本次撤回原子生效：
+#                                                  group 为空串表示未启用分组
+#
+# 与报到 / 取消 / 延期 / 替补 / 批量报到脚本一样在 Redis 单线程内原子执行：
+# 终态（frozen/cancel/截止）校验、名单校验、已报到校验、checked SREM 与
+# gcheck HINCRBY -1、撤回审计事件 RPUSH 之间不可能插入任何其他脚本。
+# 撤回与单人或批量报到并发时以 Redis 实际生效顺序裁决：报到先使屏障达标，
+# frozen 键已存在，本脚本在首道终态校验即失败，checked / gcheck / frozen
+# 与既有事件全部保持不变；撤回先生效则成员恢复未报到，之后的报到正常计数。
+WITHDRAW_SCRIPT = """
+local meta_key    = KEYS[1]
+local roster_key  = KEYS[2]
+local checked_key = KEYS[3]
+local frozen_key  = KEYS[4]
+local events_key  = KEYS[5]
+local cancel_key  = KEYS[6]
+local gmap_key    = KEYS[7]
+local gcheck_key  = KEYS[8]
+local pid         = ARGV[1]
+local reason      = ARGV[2]
+local now         = tonumber(ARGV[3])
+
+if redis.call('HEXISTS', meta_key, 'threshold') == 0 then
+    return {'unknown'}
+end
+
+-- 终态一：达标冻结快照已存在，撤回不得触碰冻结名单与分组计数。
+-- 放在名单校验之前：并发报到先冻结 quorum 的瞬间，撤回必须失败且零副作用。
+if redis.call('HEXISTS', frozen_key, 'quorum') == 1 then
+    return {'reached',
+        redis.call('HGET', frozen_key, 'quorum'),
+        redis.call('HGET', frozen_key, 'frozen_at')}
+end
+
+-- 终态二：取消快照已存在，终态不可回退。
+if redis.call('HEXISTS', cancel_key, 'cancelled_at') == 1 then
+    return {'cancelled'}
+end
+
+-- 终态三：已过当前截止时间（expired 不落键，靠时间判定），不得撤回。
+local deadline = tonumber(redis.call('HGET', meta_key, 'deadline'))
+if now >= deadline then
+    return {'expired'}
+end
+
+-- 名单校验：只能撤回当前名单成员的报到；已被替补换下的原标识不在名单内。
+if redis.call('SISMEMBER', roster_key, pid) == 0 then
+    return {'not_participant', pid}
+end
+
+-- 已报到才可撤回；从未报到或此前已撤回（重复撤回）一律拒绝。
+if redis.call('SISMEMBER', checked_key, pid) == 0 then
+    return {'not_checked_in', pid}
+end
+
+-- 启用分组配额时同步扣减所属组的去重报到人数；成员确在 checked 中，
+-- 其 gmap 分组必然存在（替补只继承分组），计数只减不溢，无需下限保护。
+local group = redis.call('HGET', gmap_key, pid)
+redis.call('SREM', checked_key, pid)
+if group then
+    redis.call('HINCRBY', gcheck_key, group, -1)
+end
+
+-- 撤回审计事件与状态变更处于同一原子脚本，seq 接续现有连续序号序列
+-- （与报到、替补事件共用同一 events 列表），记录成员、非空原因与时间。
+local seq = redis.call('LLEN', events_key) + 1
+redis.call('RPUSH', events_key, cjson.encode({
+    seq = seq,
+    participant_id = pid,
+    result = 'withdrawn',
+    reason = reason,
+    ts = now
+}))
+
+-- 与其它脚本一致地把全部相关键的存活期再锚定到 meta 中的 ttl_ms。
+local ttl_ms = tonumber(redis.call('HGET', meta_key, 'ttl_ms'))
+if ttl_ms then
+    redis.call('PEXPIRE', meta_key, ttl_ms)
+    redis.call('PEXPIRE', roster_key, ttl_ms)
+    redis.call('PEXPIRE', checked_key, ttl_ms)
+    redis.call('PEXPIRE', frozen_key, ttl_ms)
+    redis.call('PEXPIRE', events_key, ttl_ms)
+    redis.call('PEXPIRE', cancel_key, ttl_ms)
+    redis.call('PEXPIRE', gmap_key, ttl_ms)
+    redis.call('PEXPIRE', gcheck_key, ttl_ms)
+end
+
+return {'withdrawn', pid, tostring(group or ''), tostring(now),
+    tostring(redis.call('SCARD', checked_key))}
+"""
+
+
 class BarrierNotFound(Exception):
     """屏障不存在或已过期清理。"""
 
@@ -782,6 +892,13 @@ class BatchNotParticipant(Exception):
 
 class IdempotencyConflict(Exception):
     """同一幂等键已用于另一份参与者列表；首次结果不可被改写。"""
+
+
+class ParticipantNotCheckedIn(Exception):
+    """撤回被拒绝：成员在当前名单内但当前未报到（从未报到或已被撤回）。
+
+    重复撤回（成员此前已撤回、已恢复未报到状态）也归入本异常。
+    """
 
 
 @dataclass(frozen=True)
@@ -848,11 +965,21 @@ class SubstituteResult:
 
 
 @dataclass(frozen=True)
+class WithdrawResult:
+    participant_id: str  # 被撤回报到的当前名单成员
+    reason: str  # 撤回原因（非空，首尾空白已在 API 层去除）
+    # 所属分组；未启用分组配额时为 None
+    group: str | None
+    withdrawn_at: float
+    # 撤回生效后的当前去重报到人数
+    checked_count: int
+
+
+@dataclass(frozen=True)
 class BatchParticipant:
     participant_id: str
     # checked_in | already_checked_in | reached | late
     result: str
-
 
 @dataclass(frozen=True)
 class BatchCheckinResult:
@@ -880,6 +1007,7 @@ class BarrierStore:
         self._extend = redis.register_script(EXTEND_SCRIPT)
         self._substitute = redis.register_script(SUBSTITUTE_SCRIPT)
         self._batch_checkin = redis.register_script(BATCH_CHECKIN_SCRIPT)
+        self._withdraw = redis.register_script(WITHDRAW_SCRIPT)
 
     @staticmethod
     def channel(barrier_id: str) -> str:
@@ -1160,6 +1288,69 @@ class BarrierStore:
         # 仅真正完成换人时广播；等待者收到后回读最新 roster 与分组映射。
         # 发布丢失也无碍：等待者的轮询兜底同样会回读最新状态。
         await self.redis.publish(self.channel(barrier_id), "participant_replaced")
+        return result
+
+    async def withdraw_checkin(
+        self,
+        barrier_id: str,
+        participant_id: str,
+        reason: str,
+        now: float | None = None,
+    ) -> WithdrawResult:
+        """撤回报到：达标前把已生效的成员报到原子移出报到集合。
+
+        仅当屏障仍处于 waiting、成员在当前名单内且**当前已报到**时生效；
+        撤回在同一段 Lua 脚本内完成 checked SREM、启用分组配额时的所属组
+        计数 HINCRBY -1 与撤回审计事件（成员 / 非空原因 / 时间）追加，
+        撤回后成员恢复未报到，可再次正常报到。与单人或批量报到、取消、
+        延期、替补并发时以 Redis 实际生效顺序裁决：
+
+        - 并发报到先使屏障达标（frozen 已写入）→ :class:`BarrierReached`，
+          冻结名单与分组快照保持不变，本次撤回零副作用；
+        - 已取消 / 已截止 → :class:`BarrierCancelled` / :class:`BarrierExpired`；
+        - 成员不在当前名单（从未在名单或已被替补换下）→ :class:`NotAParticipant`；
+        - 成员在名单内但未报到（从未报到或此前已撤回 —— 重复撤回）→
+          :class:`ParticipantNotCheckedIn`；
+        - 屏障不存在 → :class:`BarrierNotFound`。
+
+        成功后发布 ``checkin_withdrawn`` 唤醒 /wait 等待者回读撤回后的进度；
+        屏障仍未达标时等待者继续等待。
+        """
+        keys = self._keys(barrier_id)
+        raw = await self._withdraw(
+            keys=list(keys),
+            args=[
+                participant_id,
+                reason,
+                f"{(now if now is not None else time.time()):.3f}",
+            ],
+        )
+        status = raw[0]
+
+        if status == "unknown":
+            raise BarrierNotFound(barrier_id)
+        if status == "reached":
+            raise BarrierReached(barrier_id)
+        if status == "cancelled":
+            raise BarrierCancelled(barrier_id)
+        if status == "expired":
+            raise BarrierExpired(barrier_id)
+        if status == "not_participant":
+            raise NotAParticipant(raw[1])
+        if status == "not_checked_in":
+            raise ParticipantNotCheckedIn(raw[1])
+
+        result = WithdrawResult(
+            participant_id=raw[1],
+            reason=reason,
+            group=raw[2] or None,
+            withdrawn_at=float(raw[3]),
+            checked_count=int(raw[4]),
+        )
+
+        # 仅真正完成撤回时广播；撤回不产生终态，等待者回读进度后继续等待。
+        # 发布丢失也无碍：等待者的轮询兜底同样会回读最新状态。
+        await self.redis.publish(self.channel(barrier_id), "checkin_withdrawn")
         return result
 
     @staticmethod
