@@ -330,6 +330,39 @@ class ReplaceResponse(BaseModel):
     view: BarrierView
 
 
+class WithdrawCheckinRequest(BaseModel):
+    participant_id: str = Field(
+        ..., min_length=1, description="被撤回报到的参与者标识（必须属于当前名单且已报到）"
+    )
+    reason: str = Field(
+        ...,
+        min_length=1,
+        description="撤回原因，非空；去除首尾空白后不得为空字符串",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "WithdrawCheckinRequest":
+        # 与取消原因一致地清洗：去首尾空白后两个字段都必须非空。
+        pid = self.participant_id.strip()
+        if not pid:
+            raise ValueError("participant_id 不得为空白字符串")
+        reason = self.reason.strip()
+        if not reason:
+            raise ValueError("reason 不得为空白字符串")
+        self.participant_id = pid
+        self.reason = reason
+        return self
+
+
+class WithdrawCheckinResponse(BaseModel):
+    barrier_id: str
+    status: str = Field(description="withdrawn（本次撤回报到原子生效）")
+    participant_id: str = Field(description="被撤回报到的成员标识（撤回后可再次报到）")
+    reason: str = Field(description="撤回原因（去首尾空白后保存）")
+    withdrawn_at: datetime = Field(description="撤回生效时间（UTC，Redis 裁决时刻）")
+    view: BarrierView
+
+
 class CheckinEvent(BaseModel):
     seq: int = Field(description="事件序号，从 1 开始单调递增，只追加不回改")
     participant_id: str = Field(
@@ -340,7 +373,7 @@ class CheckinEvent(BaseModel):
     result: str = Field(
         description=(
             "checked_in | already_checked_in | reached | late | replaced"
-            "（replaced 为运行中参与者替补事件）"
+            "（replaced 为运行中参与者替补事件）| withdrawn（达标前撤回误报）"
         )
     )
     ts: datetime = Field(description="事件发生时间（UTC）")
@@ -349,6 +382,12 @@ class CheckinEvent(BaseModel):
     original_participant_id: str | None = Field(
         default=None,
         description="仅替补事件出现：被换下的原参与者标识",
+    )
+    # 仅撤回事件（result=withdrawn）出现：撤回人提交的非空原因；
+    # 报到与替补事件不返回该字段。
+    reason: str | None = Field(
+        default=None,
+        description="仅撤回事件出现：撤回已生效报到时提交的非空原因",
     )
 
 

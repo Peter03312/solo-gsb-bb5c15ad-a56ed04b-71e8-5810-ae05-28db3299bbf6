@@ -25,6 +25,9 @@ Redis 单线程串行执行脚本，先发生者成为唯一终态，任何路�
 脚本与前两者同样地原子竞争：终态键（frozen/cancel）或已过截止的屏障一律
 拒绝延期与替补，绝不复活终态。批量报到由第五段 Lua 脚本在同一原子操作内
 完成全员名单校验、截止/取消校验、整批报到、达标冻结与幂等记录落盘。
+达标的误报可由第六段撤回脚本在仍 waiting 时原子撤回：移出报到集合、
+扣减所属分组计数并追加带原因的 withdrawn 审计事件；若报到先使屏障达标，
+撤回必败，冻结名单与分组快照保持不变。
 
 频道 ``barrier:{bid}:events`` 在达标冻结后发布 ``reached`` 消息、
 在主动取消后发布 ``cancelled`` 消息、在成功延期后发布 ``deadline_extended``
@@ -189,6 +192,103 @@ end
 record_event('already_checked_in')
 refresh_ttl()
 return {'already_checked_in', '0', '', '0'}
+"""
+
+
+# 撤回报到脚本（达标前撤回误报）。返回数组：
+#   {'unknown'}              屏障不存在
+#   {'not_participant', pid} 撤回者不在当前名单内（含已被替补换下的原成员）
+#   {'reached'}              屏障已达标冻结，撤回被拒绝（冻结快照永不改写）
+#   {'cancelled'}            屏障已被主动取消，撤回被拒绝
+#   {'expired'}              已过截止时间，撤回被拒绝
+#   {'not_checked_in', pid}  该成员当前未报到（含对同一条报到的重复撤回）
+#   {'withdrawn', pid, ts}   本次撤回生效：SREM checked、分组计数 -1、追加事件
+#
+# 与报到 / 取消 / 延期 / 替补 / 批量报到脚本在同一 Redis 上串行竞争：
+# 全部校验（终态、截止、名单、已报到）与「SREM checked + HINCRBY -1 + RPUSH
+# 审计事件」在同一段脚本内原子完成，因此撤回与并发报到、取消、截止的裁决完全
+# 以 Redis 实际生效顺序为准——若某条报到先使屏障达标，本脚本必然先看到
+# frozen 键而返回 reached，checked / gcheck / frozen 均保持不变。
+WITHDRAW_SCRIPT = """
+local meta_key    = KEYS[1]
+local roster_key  = KEYS[2]
+local checked_key = KEYS[3]
+local frozen_key  = KEYS[4]
+local events_key  = KEYS[5]
+local cancel_key  = KEYS[6]
+local gmap_key    = KEYS[7]
+local gcheck_key  = KEYS[8]
+local pid         = ARGV[1]
+local reason      = ARGV[2]
+local now         = tonumber(ARGV[3])
+
+if redis.call('HEXISTS', meta_key, 'threshold') == 0 then
+    return {'unknown'}
+end
+
+-- 名单校验优先于一切状态，与单人 / 批量报到脚本一致：非当前名单成员（含已被
+-- 先执行的替补换下的原成员）永远不能撤回，也不允许借终态/截止判定改写状态。
+if redis.call('SISMEMBER', roster_key, pid) == 0 then
+    return {'not_participant', pid}
+end
+
+-- 终态一：达标冻结之后任何路径都不得改写 quorum / group_counts / 冻结快照。
+-- 撤回只允许在 waiting 阶段进行；先于本脚本达标的报到因此成为唯一赢家。
+if redis.call('HEXISTS', frozen_key, 'quorum') == 1 then
+    return {'reached'}
+end
+
+-- 终态二：取消之后报到集合作为取消快照保留，撤回同样不得改写。
+if redis.call('HEXISTS', cancel_key, 'cancelled_at') == 1 then
+    return {'cancelled'}
+end
+
+-- 终态三：已过当前截止时间（expired 不落键，靠时间判定），撤回不得改写。
+local deadline = tonumber(redis.call('HGET', meta_key, 'deadline'))
+if now >= deadline then
+    return {'expired'}
+end
+
+-- 仅当该成员确实在当前报到集合中时撤回才生效；重复撤回（SREM 返回 0，
+-- 例如报到已被先执行的撤回移出）在此被原子拒绝，不产生任何事件或计数变更。
+local removed = redis.call('SREM', checked_key, pid)
+if removed == 0 then
+    return {'not_checked_in', pid}
+end
+
+-- 去重报到集合移除后同步扣减所属分组人数；未启用分组配额时 gmap 不存在，
+-- group 为空、HINCRBY 不执行。gcheck 不会被扣到 0 以下：计数与集合严格一致。
+local group = redis.call('HGET', gmap_key, pid)
+if group then
+    redis.call('HINCRBY', gcheck_key, group, -1)
+end
+
+-- 撤回审计事件：与集合 / 计数变更处于同一原子脚本，记录成员、非空原因与
+-- Redis 裁决时刻；seq 自 1 递增（下标 = seq - 1），与报到 / 替补事件共用
+-- 同一连续序号序列。
+local seq = redis.call('LLEN', events_key) + 1
+redis.call('RPUSH', events_key, cjson.encode({
+    seq = seq,
+    participant_id = pid,
+    result = 'withdrawn',
+    reason = reason,
+    ts = now
+}))
+
+-- 与报到脚本一致地把全部相关键的存活期再锚定到 meta 中的 ttl_ms。
+local ttl_ms = tonumber(redis.call('HGET', meta_key, 'ttl_ms'))
+if ttl_ms then
+    redis.call('PEXPIRE', meta_key, ttl_ms)
+    redis.call('PEXPIRE', roster_key, ttl_ms)
+    redis.call('PEXPIRE', checked_key, ttl_ms)
+    redis.call('PEXPIRE', frozen_key, ttl_ms)
+    redis.call('PEXPIRE', events_key, ttl_ms)
+    redis.call('PEXPIRE', cancel_key, ttl_ms)
+    redis.call('PEXPIRE', gmap_key, ttl_ms)
+    redis.call('PEXPIRE', gcheck_key, ttl_ms)
+end
+
+return {'withdrawn', pid, tostring(now)}
 """
 
 
@@ -780,6 +880,25 @@ class BatchNotParticipant(Exception):
     """
 
 
+class WithdrawNotCheckedIn(Exception):
+    """撤回被拒绝：该成员当前未在报到集合中（含对同一条报到的重复撤回）。
+
+    撤回与报到 / 取消 / 截止按 Redis 实际生效顺序裁决：若成员的报到已被
+    先执行的撤回移出，或该成员从未报到，本次撤回不改任何状态与事件。
+    """
+
+
+class BarrierWithdrawConflict(Exception):
+    """撤回被拒绝：屏障已进入终态（reached/cancelled/expired）。
+
+    仅 waiting 屏障允许撤回报到；参数携带 Lua 裁决出的终态原因。
+    """
+
+
+class WithdrawNotParticipant(Exception):
+    """撤回者不在屏障当前名单内（从未属于名单，或已被替补换下）。"""
+
+
 class IdempotencyConflict(Exception):
     """同一幂等键已用于另一份参与者列表；首次结果不可被改写。"""
 
@@ -848,6 +967,13 @@ class SubstituteResult:
 
 
 @dataclass(frozen=True)
+class WithdrawResult:
+    participant_id: str  # 被撤回报到的名单成员
+    reason: str  # 撤回原因（非空，去首尾空白）
+    withdrawn_at: float  # 撤回生效时间（Redis 裁决时刻）
+
+
+@dataclass(frozen=True)
 class BatchParticipant:
     participant_id: str
     # checked_in | already_checked_in | reached | late
@@ -880,6 +1006,7 @@ class BarrierStore:
         self._extend = redis.register_script(EXTEND_SCRIPT)
         self._substitute = redis.register_script(SUBSTITUTE_SCRIPT)
         self._batch_checkin = redis.register_script(BATCH_CHECKIN_SCRIPT)
+        self._withdraw = redis.register_script(WITHDRAW_SCRIPT)
 
     @staticmethod
     def channel(barrier_id: str) -> str:
@@ -1161,6 +1288,60 @@ class BarrierStore:
         # 发布丢失也无碍：等待者的轮询兜底同样会回读最新状态。
         await self.redis.publish(self.channel(barrier_id), "participant_replaced")
         return result
+
+    async def withdraw_checkin(
+        self,
+        barrier_id: str,
+        participant_id: str,
+        reason: str,
+        now: float | None = None,
+    ) -> WithdrawResult:
+        """达标前撤回成员的已生效报到（误报撤回）。
+
+        仅当屏障仍处于 waiting、成员属于当前名单且当前确实已报到时生效；
+        一次撤回在同一段 Lua 脚本内原子完成：从报到集合 SREM 该成员、
+        启用分组配额时 HINCRBY 其所属分组 -1、在既有连续序号的审计流追加
+        一条带非空原因与时间的 withdrawn 事件。撤回后该成员可再次报到。
+
+        与单人 / 批量报到、取消、截止（以及延期、替补）的裁决完全以 Redis
+        实际生效顺序为准：
+
+        - 屏障不存在 → :class:`BarrierNotFound`；
+        - 成员不在当前名单（含已被替补换下）→ :class:`WithdrawNotParticipant`；
+        - 成员当前未报到（从未报到，或对同一条报到重复撤回）→
+          :class:`WithdrawNotCheckedIn`；
+        - reached / cancelled / expired → :class:`BarrierWithdrawConflict`，
+          冻结名单与分组快照、取消快照、截止结果均保持不变。
+
+        若并发报到先使屏障达标，脚本必然先看到 frozen 键而返回 reached，
+        本次撤回不产生任何集合、计数或事件变更。撤回不发布 Pub/Sub：
+        它不改变终态，等待者的轮询兜底自然反映撤回后的进度。
+        """
+        keys = self._keys(barrier_id)
+        raw = await self._withdraw(
+            keys=list(keys),
+            args=[
+                participant_id,
+                reason,
+                f"{(now if now is not None else time.time()):.3f}",
+            ],
+        )
+        status = raw[0]
+
+        if status == "unknown":
+            raise BarrierNotFound(barrier_id)
+        if status == "not_participant":
+            raise WithdrawNotParticipant(raw[1])
+        if status == "not_checked_in":
+            raise WithdrawNotCheckedIn(raw[1])
+        if status in ("reached", "cancelled", "expired"):
+            raise BarrierWithdrawConflict(status)
+
+        return WithdrawResult(
+            participant_id=raw[1],
+            reason=reason,
+            withdrawn_at=float(raw[2]),
+        )
 
     @staticmethod
     def _batch_fingerprint(participants: list[str]) -> str:

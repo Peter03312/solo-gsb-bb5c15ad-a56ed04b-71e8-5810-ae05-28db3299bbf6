@@ -8,8 +8,9 @@
   POST   /barriers/{bid}/cancel             主动取消（与达标报到原子竞争，先发生者为唯一终态）
   PATCH  /barriers/{bid}/deadline           运行中延期（仅 waiting 且新时间更晚时原子生效）
   POST   /barriers/{bid}/replace            运行中替补（未报到成员原子换为名单外新标识并继承分组）
+  POST   /barriers/{bid}/withdraw-checkin   达标前撤回误报（移出报到集合、扣减分组计数、记录带原因的 withdrawn 事件）
   GET    /barriers/{bid}/wait               阻塞等待达标 / 取消 / 截止
-  GET    /barriers/{bid}/events             审计事件（报到 + 替补，cursor/limit 分页）
+  GET    /barriers/{bid}/events             审计事件（报到 + 替补 + 撤回，cursor/limit 分页）
 
 达标结果交接（独立持久保存，屏障回收不影响交接单）：
   POST   /handoffs                          仅为已达标屏障建立交接单（复制 quorum/frozen_at；同屏障重复返回原单）
@@ -44,11 +45,14 @@ from .barrier_store import (
     BarrierReached,
     BarrierStore,
     BarrierSubstituteConflict,
+    BarrierWithdrawConflict,
     BatchNotParticipant,
     IdempotencyConflict,
     NotAParticipant,
     ParticipantNotInRoster,
     ReplacementInRoster,
+    WithdrawNotCheckedIn,
+    WithdrawNotParticipant,
 )
 from .config import load_settings
 from .handoff_store import (
@@ -85,6 +89,8 @@ from .models import (
     RenewResponse,
     ReplaceRequest,
     ReplaceResponse,
+    WithdrawCheckinRequest,
+    WithdrawCheckinResponse,
 )
 from .recon_store import ReconciliationConflict, ReconStore
 from .service import _dt, build_handoff_view, build_recon_view, build_view, build_view_from_snapshot, wait_for_settle
@@ -108,10 +114,10 @@ app = FastAPI(
     title="任务收尾屏障 API",
     description=(
         "并行任务协调收尾：创建屏障、幂等报到、批量幂等报到、阻塞等待达标、"
-        "取消或截止、运行中延期与运行中参与者替补；屏障达标后可建立独立持久"
-        "保存的达标结果交接单，支持栅栏令牌租约（认领 / 续租 / 完成）。"
+        "取消或截止、运行中延期、运行中参与者替补与达标前撤回误报；屏障达标后"
+        "可建立独立持久保存的达标结果交接单，支持栅栏令牌租约（认领 / 续租 / 完成）。"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -149,6 +155,7 @@ async def root() -> dict[str, object]:
             "cancel": "POST /barriers/{barrier_id}/cancel",
             "extend": "PATCH /barriers/{barrier_id}/deadline",
             "replace": "POST /barriers/{barrier_id}/replace",
+            "withdraw_checkin": "POST /barriers/{barrier_id}/withdraw-checkin",
             "wait": "GET /barriers/{barrier_id}/wait",
             "events": "GET /barriers/{barrier_id}/events",
             "create_handoff": "POST /handoffs",
@@ -498,6 +505,87 @@ async def replace_participant(
     )
 
 
+@app.post(
+    "/barriers/{barrier_id}/withdraw-checkin",
+    response_model=WithdrawCheckinResponse,
+    tags=["barriers"],
+)
+async def withdraw_checkin(
+    barrier_id: str, payload: WithdrawCheckinRequest, request: Request
+) -> WithdrawCheckinResponse:
+    """达标前撤回成员已生效的报到（现场成员误报时使用）。
+
+    提交屏障标识、成员标识与**非空原因**，仅当屏障仍处于 ``waiting`` 且该
+    成员属于当前名单并**已报到**时生效。一次撤回在同一段 Redis Lua 脚本内
+    原子完成：
+
+    - 把成员移出报到集合（``SREM checked``）；
+    - 启用分组配额时同步把其所属分组的报到人数 ``HINCRBY -1``；
+    - 在既有连续序号的审计流追加一条记录成员、原因与时间的 ``withdrawn``
+      事件（与集合 / 计数变更同生共死）。
+
+    撤回与单人 / 批量报到、取消、截止（以及延期、替补）全部由 Redis 单线程
+    串行化，按实际生效顺序裁决：**若某条报到先使屏障达标，本请求必败**，
+    返回 ``409`` 且冻结名单与分组快照保持不变；撤回后成员可再次报到。
+
+    冲突与错误（均不改任何状态与事件）：
+
+    - 成员不在当前名单（含已被替补换下、屏障从未声明该成员）→ ``403``；
+    - 成员当前未报到（从未报到，或对同一条报到**重复撤回**）→ ``409``；
+    - 屏障已 ``reached`` / ``cancelled`` / ``expired`` → ``409``，终态绝不
+      因撤回改变；
+    - 屏障不存在 / 已回收 → ``404``；``reason`` 为空或纯空白 → ``422``。
+
+    撤回不发布 Pub/Sub（它不改变终态）；状态查询与阻塞等待的轮询兜底会自然
+    反映撤回后的进度。
+    """
+    meta = await _load_meta(request, barrier_id)
+    svc = store(request)
+    try:
+        result = await svc.withdraw_checkin(
+            barrier_id,
+            participant_id=payload.participant_id,
+            reason=payload.reason,
+        )
+    except WithdrawNotParticipant:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"参与者 {payload.participant_id!r} 不在该屏障当前名单内"
+                "（可能已被替补换下），不能撤回报到"
+            ),
+        )
+    except WithdrawNotCheckedIn:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"参与者 {payload.participant_id!r} 当前未报到（可能从未报到，"
+                "或该报到已被撤回），重复撤回不生效"
+            ),
+        )
+    except BarrierWithdrawConflict as exc:
+        reason = exc.args[0] if exc.args else "conflict"
+        detail = {
+            "reached": "屏障已达标，冻结快照不可撤回（报到已先使屏障达标）",
+            "cancelled": "屏障已被取消，取消快照中的报到不可撤回",
+            "expired": "屏障已过截止时间，报到不可撤回",
+        }.get(reason, "撤回报到冲突")
+        raise HTTPException(status_code=409, detail=detail)
+    except BarrierNotFound:
+        raise HTTPException(status_code=404, detail="屏障不存在或已过期回收")
+
+    # checked / gcheck 已在 Lua 内改写：重新读取实时状态，视图反映撤回后进度。
+    view = await build_view(svc, meta)
+    return WithdrawCheckinResponse(
+        barrier_id=barrier_id,
+        status="withdrawn",
+        participant_id=result.participant_id,
+        reason=result.reason,
+        withdrawn_at=_dt(result.withdrawn_at),
+        view=view,
+    )
+
+
 @app.get("/barriers/{barrier_id}/wait", response_model=BarrierView, tags=["barriers"])
 async def wait_barrier(barrier_id: str, request: Request) -> BarrierView:
     """阻塞等待直到屏障达标、被取消（立即返回终态快照）或截止（返回报到成员与缺席名单）。
@@ -537,10 +625,11 @@ async def list_events(
     每批至多一条 reached）都会在与状态变更同一 Redis 原子操作中追加一条
     事件；运行中参与者替补成功时也在换人脚本内追加一条 ``replaced`` 事件
     （``participant_id`` 为换上的新标识，``original_participant_id`` 为被
-    换下的原成员）。非名单成员、截止后报到、被整批拒绝的批量报到、被拒绝
-    的替补等错误请求不产生事件；批量报到的幂等重试只回放首次结果，不重复
-    追加事件。事件只增不改，游标分页在并发写入下稳定不重不漏；屏障回收后
-    事件一并消失。
+    换下的原成员）；达标前撤回误报时在撤回脚本内追加一条 ``withdrawn``
+    事件（携带撤回人提交的非空 ``reason``）。非名单成员、截止后报到、被整批
+    拒绝的批量报到、被拒绝的替补、重复撤回或终态后撤回等错误请求不产生事件；
+    批量报到的幂等重试只回放首次结果，不重复追加事件。事件只增不改，游标
+    分页在并发写入下稳定不重不漏；屏障回收后事件一并消失。
     """
     await _load_meta(request, barrier_id)
     events, next_cursor = await store(request).list_events(barrier_id, cursor, limit)
@@ -553,6 +642,7 @@ async def list_events(
                 result=e["result"],
                 ts=_dt(e["ts"]),
                 original_participant_id=e.get("original_participant_id"),
+                reason=e.get("reason"),
             )
             for e in events
         ],

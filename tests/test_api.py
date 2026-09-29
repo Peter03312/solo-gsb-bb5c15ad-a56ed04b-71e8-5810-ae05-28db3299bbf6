@@ -69,6 +69,13 @@ async def replace(client: AsyncClient, bid: str, original: str, replacement: str
     )
 
 
+async def withdraw(client: AsyncClient, bid: str, pid: str, reason="误报撤回"):
+    return await client.post(
+        f"/barriers/{bid}/withdraw-checkin",
+        json={"participant_id": pid, "reason": reason},
+    )
+
+
 async def batch_checkin(client: AsyncClient, bid: str, participants, key: str):
     return await client.post(
         f"/barriers/{bid}/batch-checkins",
@@ -2310,4 +2317,445 @@ async def test_batch_endpoint_present_in_openapi():
         # 根端点清单也包含批量接口
         root = (await c.get("/")).json()
         assert root["endpoints"]["batch_checkin"] == f"POST {path}"
+
+
+# ---------------------------------------------------------------------------
+# 达标前撤回误报 withdraw-checkin
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_withdraw_basic_removes_checkin_and_progress_reflected():
+    """waiting 阶段撤回：移出报到集合、计数 -1，状态查询与响应 view 同步反映。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=30)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+        await checkin(c, bid, "b")
+        assert (await c.get(f"/barriers/{bid}")).json()["checked_count"] == 2
+
+        r = await withdraw(c, bid, "a", "node-a 为误报，需撤回")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "withdrawn"
+        assert body["participant_id"] == "a"
+        assert body["reason"] == "node-a 为误报，需撤回"
+        assert body["withdrawn_at"]
+        view = body["view"]
+        assert view["status"] == "waiting"
+        assert view["checked_in"] == ["b"]
+        assert view["checked_count"] == 1
+        assert view["quorum"] is None
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["status"] == "waiting"
+        assert g["checked_in"] == ["b"]
+        assert g["checked_count"] == 1
+
+        # 撤回后该成员可再次报到
+        again = await checkin(c, bid, "a")
+        assert again.status_code == 200
+        assert again.json()["status"] == "checked_in"
+
+
+@pytest.mark.asyncio
+async def test_withdraw_then_other_can_trigger_reach():
+    """撤回使人数跌回阈值以下；撤回成员再报到与他人报到后仍可正常达标。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["p", "q", "r"], threshold=3, ttl_s=30)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "p")
+        await checkin(c, bid, "q")
+        assert (await withdraw(c, bid, "p")).status_code == 200
+        # 撤回后仅 q 报到：p 再报到为 checked_in（2 人），r 报到才达标
+        assert (await checkin(c, bid, "p")).json()["status"] == "checked_in"
+        reach = await checkin(c, bid, "r")
+        assert reach.json()["status"] == "reached"
+        assert sorted(reach.json()["quorum"]) == ["p", "q", "r"]
+
+
+@pytest.mark.asyncio
+async def test_withdraw_recheckin_does_not_double_count_groups():
+    """启用分组配额：撤回扣减所属组人数；撤回后再报到重新计数，不多不少。"""
+    async with await _client() as c:
+        groups = {
+            "dc1-a": "dc1", "dc1-b": "dc1",
+            "dc2-a": "dc2",
+        }
+        quotas = {"dc1": 1, "dc2": 1}
+        b = await create_barrier(
+            c, ["dc1-a", "dc1-b", "dc2-a"],
+            threshold=3, ttl_s=30, groups=groups, quotas=quotas,
+        )
+        bid = b["barrier_id"]
+
+        await checkin(c, bid, "dc1-a")
+        await checkin(c, bid, "dc1-b")
+        g = (await c.get(f"/barriers/{bid}")).json()
+        dc1 = [x for x in g["group_progress"] if x["group"] == "dc1"][0]
+        assert dc1["checked_count"] == 2
+
+        assert (await withdraw(c, bid, "dc1-a")).status_code == 200
+        g = (await c.get(f"/barriers/{bid}")).json()
+        progress = {x["group"]: x for x in g["group_progress"]}
+        assert progress["dc1"]["checked_count"] == 1
+        assert progress["dc1"]["satisfied"] is True
+        assert g["checked_in"] == ["dc1-b"]
+
+        # 撤回后再报到：组计数从 1 增加到 2，而不是错误翻倍
+        assert (await checkin(c, bid, "dc1-a")).json()["status"] == "checked_in"
+        g = (await c.get(f"/barriers/{bid}")).json()
+        progress = {x["group"]: x for x in g["group_progress"]}
+        assert progress["dc1"]["checked_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_withdraw_keeps_barrier_waiting_when_group_quota_was_only_blocker():
+    """撤回刚补齐某组配额的成员：组配额重新不满足，屏障保持 waiting 不达标。"""
+    async with await _client() as c:
+        groups = {"a": "g1", "b": "g1", "c": "g2"}
+        quotas = {"g1": 1, "g2": 1}
+        b = await create_barrier(
+            c, ["a", "b", "c"], threshold=2, ttl_s=30,
+            groups=groups, quotas=quotas,
+        )
+        bid = b["barrier_id"]
+        # a（g1）+ c（g2）报到：总数 2 且两组各满足 -> 达标
+        await checkin(c, bid, "a")
+        reached = await checkin(c, bid, "c")
+        assert reached.json()["status"] == "reached"
+        # 已达标撤回必败
+        assert (await withdraw(c, bid, "c")).status_code == 409
+
+        # 另一屏障：先 a、b（g1 两人，总数 2 但缺 g2），不会达标
+        b2 = await create_barrier(
+            c, ["a", "b", "c"], threshold=2, ttl_s=30,
+            groups=groups, quotas=quotas,
+        )
+        bid2 = b2["barrier_id"]
+        await checkin(c, bid2, "a")
+        await checkin(c, bid2, "b")
+        assert (await c.get(f"/barriers/{bid2}")).json()["status"] == "waiting"
+        # 撤回 a：g1 仍有 b，配额仍满足；再由 c 补齐 g2 才达标
+        assert (await withdraw(c, bid2, "a")).status_code == 200
+        assert (await c.get(f"/barriers/{bid2}")).json()["status"] == "waiting"
+        reach = await checkin(c, bid2, "c")
+        assert reach.json()["status"] == "reached"
+        assert sorted(reach.json()["quorum"]) == ["b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_withdraw_after_reached_fails_and_snapshot_unchanged():
+    """达标后撤回：409，checked 集合、quorum / frozen_at / group_progress 均不变。"""
+    async with await _client() as c:
+        groups = {"a": "g1", "b": "g2"}
+        b = await create_barrier(
+            c, ["a", "b"], threshold=2, ttl_s=30,
+            groups=groups, quotas={"g1": 1, "g2": 1},
+        )
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+        await checkin(c, bid, "b")
+        before = (await c.get(f"/barriers/{bid}")).json()
+
+        r = await withdraw(c, bid, "a", "误报")
+        assert r.status_code == 409
+        after = (await c.get(f"/barriers/{bid}")).json()
+        assert after["status"] == "reached"
+        assert after["checked_in"] == before["checked_in"]
+        assert after["quorum"] == before["quorum"]
+        assert after["frozen_at"] == before["frozen_at"]
+        assert after["group_progress"] == before["group_progress"]
+        # 失败不产生事件
+        events = (await get_events(c, bid)).json()["events"]
+        assert all(e["result"] != "withdrawn" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_withdraw_duplicate_unknown_and_unchecked_return_errors_without_change():
+    """重复撤回 409、名单外成员 403、未报到成员 409、未知屏障 404，均无副作用。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=30)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+
+        # 未报到成员撤回 -> 409
+        r = await withdraw(c, bid, "b")
+        assert r.status_code == 409
+        # 名单外成员 -> 403
+        r = await withdraw(c, bid, "outsider")
+        assert r.status_code == 403
+        # 未知屏障 -> 404
+        r = await withdraw(c, "deadbeefdeadbeef", "a")
+        assert r.status_code == 404
+
+        # 成功撤回一次
+        assert (await withdraw(c, bid, "a", "第一次撤回")).status_code == 200
+        # 重复撤回（同一成员已不在报到集合）-> 409，原因仍是新请求但不被保存
+        r = await withdraw(c, bid, "a", "第二次撤回")
+        assert r.status_code == 409
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["checked_in"] == []
+        assert g["checked_count"] == 0
+        # 只有一条 withdrawn 事件（第一次），原因字段为首次原因
+        events = (await get_events(c, bid)).json()["events"]
+        withdrawn = [e for e in events if e["result"] == "withdrawn"]
+        assert len(withdrawn) == 1
+        assert withdrawn[0]["participant_id"] == "a"
+        assert withdrawn[0]["reason"] == "第一次撤回"
+
+
+@pytest.mark.asyncio
+async def test_withdraw_rejected_after_cancel_and_expiry():
+    """已取消（409）、已截止（409）撤回均被拒绝且不改状态、不产生事件。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=30)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+        await cancel(c, bid, "放弃等待")
+        r = await withdraw(c, bid, "a")
+        assert r.status_code == 409
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["status"] == "cancelled" and g["checked_in"] == ["a"]
+        events = (await get_events(c, bid)).json()["events"]
+        assert all(e["result"] != "withdrawn" for e in events)
+
+        # 截止场景
+        b2 = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=1)
+        bid2 = b2["barrier_id"]
+        await checkin(c, bid2, "a")
+        await asyncio.sleep(1.2)
+        r = await withdraw(c, bid2, "a")
+        assert r.status_code == 409
+        g = (await c.get(f"/barriers/{bid2}")).json()
+        assert g["status"] == "expired" and g["checked_in"] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_withdraw_request_validation_422():
+    """reason / participant_id 为空白或缺失返回 422；首尾空白被去除后保存。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=30)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+
+        assert (await c.post(
+            f"/barriers/{bid}/withdraw-checkin",
+            json={"participant_id": "a", "reason": "   "},
+        )).status_code == 422
+        assert (await c.post(
+            f"/barriers/{bid}/withdraw-checkin",
+            json={"participant_id": "a"},
+        )).status_code == 422
+        assert (await c.post(
+            f"/barriers/{bid}/withdraw-checkin",
+            json={"participant_id": " ", "reason": "x"},
+        )).status_code == 422
+
+        r = await c.post(
+            f"/barriers/{bid}/withdraw-checkin",
+            json={"participant_id": "  a  ", "reason": "  误报，撤回  "},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["participant_id"] == "a"
+        assert body["reason"] == "误报，撤回"
+
+
+@pytest.mark.asyncio
+async def test_withdraw_event_uses_continuous_seq_and_is_paginated():
+    """withdrawn 事件与报到/替补共用连续 seq，携带 reason，分页行为不重不漏。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=30)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")          # seq 1 checked_in
+        await withdraw(c, bid, "a", "误报")  # seq 2 withdrawn
+        await checkin(c, bid, "a")          # seq 3 checked_in（再次报到）
+        await checkin(c, bid, "b")          # seq 4 checked_in
+
+        body = (await get_events(c, bid)).json()
+        assert [e["seq"] for e in body["events"]] == [1, 2, 3, 4]
+        assert body["next_cursor"] == 4
+        results = [e["result"] for e in body["events"]]
+        assert results == ["checked_in", "withdrawn", "checked_in", "checked_in"]
+        wd = body["events"][1]
+        assert wd["participant_id"] == "a"
+        assert wd["reason"] == "误报"
+        assert wd["original_participant_id"] is None
+        # 非撤回事件不带 reason（模型序列化为 null）
+        assert body["events"][0]["reason"] is None
+
+        # 分页：每页 2 条，连续读完
+        page1 = (await get_events(c, bid, cursor=0, limit=2)).json()
+        page2 = (await get_events(c, bid, cursor=page1["next_cursor"], limit=2)).json()
+        assert [e["seq"] for e in page1["events"]] == [1, 2]
+        assert [e["seq"] for e in page2["events"]] == [3, 4]
+        assert page2["next_cursor"] == 4
+        empty = (await get_events(c, bid, cursor=4, limit=2)).json()
+        assert empty["events"] == [] and empty["next_cursor"] == 4
+
+
+@pytest.mark.asyncio
+async def test_withdraw_works_after_substitution_but_old_member_cannot_withdraw():
+    """替补后：换上的新成员报到可撤回；被换下的原成员撤回按名单外拒绝（403）。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=30)
+        bid = b["barrier_id"]
+        assert (await replace(c, bid, "b", "b-new")).status_code == 200
+        await checkin(c, bid, "b-new")
+
+        # 原成员 b 已不在名单：撤回 403 且无副作用
+        r = await withdraw(c, bid, "b")
+        assert r.status_code == 403
+        # 新成员撤回成功
+        assert (await withdraw(c, bid, "b-new")).status_code == 200
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["checked_in"] == []
+        assert "b-new" in g["participants"] and "b" not in g["participants"]
+
+
+@pytest.mark.asyncio
+async def test_withdraw_interacts_with_batch_checkin():
+    """批量首报后单人撤回可把成员移出；随后批量重试回放的是首次结果（不受撤回影响），
+    新幂等键的批量则如实看到成员已不在报到集合。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=30)
+        bid = b["barrier_id"]
+        await batch_checkin(c, bid, ["a", "b"], "batch-1")
+        assert (await withdraw(c, bid, "a", "批量误报撤回")).status_code == 200
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["checked_in"] == ["b"] and g["checked_count"] == 1
+
+        # 同幂等键重试：回放首次执行时刻快照（仍含 a），不重新写、不追加事件
+        replay = (await batch_checkin(c, bid, ["a", "b"], "batch-1")).json()
+        assert replay["replayed"] is True
+        assert sorted(replay["view"]["checked_in"]) == ["a", "b"]
+        # 回放不改实时状态
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["checked_in"] == ["b"]
+
+        # 新幂等键批量报到 a、c：a 为新报到、c 为新报到
+        r = await batch_checkin(c, bid, ["a", "c"], "batch-2")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "reached" and body["triggered"] is True
+        assert sorted(body["quorum"]) == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_withdraw_and_trigger_checkin_race_unique_outcome():
+    """撤回脚本与达标报到脚本在 Redis 内原子竞争：交替两个脚本的入队顺序，
+    两个方向各跑多轮，先执行者成为唯一赢家。
+
+    阈值 2、a 已报到（1/2）。checkin(b) 使总数达 2 而达标；
+    withdraw(a) 把 a 移出（count 1->0）。
+      - 报到先：count->2 达标冻结，撤回看到 frozen 被拒（status=reached）；
+      - 撤回先：a 被移出（count->0），b 报到后仅 1 人，继续 waiting（撤回 200）。
+    """
+    from app.barrier_store import CHECKIN_SCRIPT, WITHDRAW_SCRIPT
+    from app.main import app
+
+    async with await _client() as c:
+        outcomes = []
+        for i in range(20):
+            b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=30)
+            bid = b["barrier_id"]
+            keys = [
+                f"barrier:{bid}",
+                f"barrier:{bid}:roster",
+                f"barrier:{bid}:checked",
+                f"barrier:{bid}:frozen",
+                f"barrier:{bid}:events",
+                f"barrier:{bid}:cancel",
+                f"barrier:{bid}:gmap",
+                f"barrier:{bid}:gcheck",
+            ]
+            assert (await checkin(c, bid, "a")).json()["status"] == "checked_in"
+            now = f"{time.time():.3f}"
+            # 两个脚本放入同一事务：EXEC 时 Redis 按入队顺序串行执行，
+            # 交替顺序即可稳定覆盖“先达标”与“先撤回”两个方向。
+            pipe = app.state.store.redis.pipeline(transaction=True)
+            if i % 2 == 0:
+                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "b", now)
+                pipe.eval(WITHDRAW_SCRIPT, 8, *keys, "a", "竞态撤回", now)
+            else:
+                pipe.eval(WITHDRAW_SCRIPT, 8, *keys, "a", "竞态撤回", now)
+                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "b", now)
+            first, second = await pipe.execute()
+
+            g = (await c.get(f"/barriers/{bid}")).json()
+            events = (await get_events(c, bid)).json()["events"]
+
+            if i % 2 == 0:
+                checkin_raw, withdraw_raw = first, second
+            else:
+                withdraw_raw, checkin_raw = first, second
+
+            if g["status"] == "reached":
+                # 报到先达标：b 触发 reached；撤回脚本看到 frozen 返回 reached 拒绝
+                assert checkin_raw[0] == "reached"
+                assert withdraw_raw[0] == "reached"
+                assert sorted(g["checked_in"]) == ["a", "b"]
+                assert sorted(g["quorum"]) == ["a", "b"]
+                assert all(e["result"] != "withdrawn" for e in events)
+                outcomes.append("reached")
+            else:
+                # 撤回先生效：a 被移出；b 报到后仅 1 人，屏障继续 waiting
+                assert withdraw_raw[0] == "withdrawn"
+                assert checkin_raw[0] == "checked_in"
+                assert g["status"] == "waiting"
+                assert g["checked_in"] == ["b"] and g["checked_count"] == 1
+                # 撤回后 a 可再次报到，并与 b 一起达标
+                again = await checkin(c, bid, "a")
+                assert again.json()["status"] == "reached"
+                assert sorted(again.json()["quorum"]) == ["a", "b"]
+                outcomes.append("withdrawn")
+
+        assert set(outcomes) == {"reached", "withdrawn"}, Counter(outcomes)
+        assert Counter(outcomes)["reached"] == 10
+        assert Counter(outcomes)["withdrawn"] == 10
+
+
+@pytest.mark.asyncio
+async def test_wait_reflects_progress_after_withdraw():
+    """撤回不改变终态，等待者继续等待；撤回后再报到达标时 /wait 返回新 quorum。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=30)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+        await checkin(c, bid, "b")
+        assert (await withdraw(c, bid, "a")).status_code == 200
+
+        async def waiter():
+            return await c.get(f"/barriers/{bid}/wait")
+
+        task = asyncio.create_task(waiter())
+        await asyncio.sleep(0.2)
+        assert not task.done()  # 撤回后仍 waiting（仅 b 1 人），等待者继续挂起
+        await checkin(c, bid, "a")  # 2 人，仍 waiting
+        await asyncio.sleep(0.2)
+        assert not task.done()
+        await checkin(c, bid, "c")  # 3 人达标，等待者被唤醒
+        w = await asyncio.wait_for(task, timeout=5)
+        assert w.status_code == 200
+        body = w.json()
+        assert body["status"] == "reached"
+        assert sorted(body["quorum"]) == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_withdraw_endpoint_present_in_openapi():
+    """撤回接口与模型出现在 OpenAPI schema 与根端点清单中。"""
+    async with await _client() as c:
+        schema = (await c.get("/openapi.json")).json()
+        path = "/barriers/{barrier_id}/withdraw-checkin"
+        assert path in schema["paths"]
+        assert "WithdrawCheckinRequest" in schema["components"]["schemas"]
+        assert "WithdrawCheckinResponse" in schema["components"]["schemas"]
+        # 审计事件模型含 reason 字段
+        props = schema["components"]["schemas"]["CheckinEvent"]["properties"]
+        assert "reason" in props
+        root = (await c.get("/")).json()
+        assert root["endpoints"]["withdraw_checkin"] == f"POST {path}"
 
